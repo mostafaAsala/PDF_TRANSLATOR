@@ -5,6 +5,7 @@ import time
 import fitz  # PyMuPDF
 from PIL import Image
 from googletrans import Translator as GoogleTranslator
+from deep_translator import GoogleTranslator as DeepGoogleTranslator
 # Load model directly
 print("loading packages")
 from transformers import AutoTokenizer, MarianMTModel, AutoModelForSeq2SeqLM
@@ -16,6 +17,9 @@ model_name = f"Helsinki-NLP/opus-mt-{src}-{trg}"
 
 # Initialize Google Translator
 google_translator = GoogleTranslator()
+
+# Initialize Deep Translator
+deep_translator = None
 
 # Only load the model if needed (will be loaded on demand)
 tokenizer = None
@@ -29,8 +33,13 @@ def load_local_model():
         model = AutoModelForSeq2SeqLM.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
         print("Local model loaded")
 
-print("begin translating, ")
+def load_deep_translator():
+    # This function is kept for consistency with the other translator functions
+    # but we don't need to initialize anything globally since we create a new
+    # translator instance for each batch or individual translation
+    print("Deep Translator will be initialized for each translation request")
 
+print("begin translating, ")
 
 def int_to_rgb(color_int):
     """Convert integer color to normalized RGB tuple."""
@@ -38,7 +47,6 @@ def int_to_rgb(color_int):
     g = ((color_int >> 8) & 255) / 255
     b = (color_int & 255) / 255
     return (r, g, b)
-
 
 def extract_image_with_transparency(doc, xref):
     # Step 1: Get image object dictionary
@@ -188,11 +196,87 @@ def batch_translate_with_google(batch_texts, source_lang='zh-cn', target_lang='e
                 try:
                     result = google_translator.translate(text, src=source_lang, dest=target_lang)
                     translations.append(result.text)
-                except Exception as e: 
+                except Exception as e:
                     print(f"Error translating text '{text}': {e}")
                     translations.append(text)  # Use original as fallback
                 # Add a small delay to avoid rate limiting
-                
+
+            # Insert translations back in the correct positions
+            for batch_idx, original_idx in enumerate(non_empty_indices):
+                if batch_idx < len(translations):
+                    while len(batch_translations) <= original_idx:
+                        batch_translations.append(None)
+                    batch_translations[original_idx] = translations[batch_idx]
+                else:
+                    batch_translations.append(non_empty_texts[batch_idx])
+
+            # Fill any remaining None values
+            for idx, translation in enumerate(batch_translations):
+                if translation is None and idx < len(batch_texts):
+                    batch_translations[idx] = batch_texts[idx]
+
+    return batch_translations
+
+def batch_translate_with_deep(batch_texts, source_lang='zh-cn', target_lang='en'):
+    """Translate a batch of texts using Deep Translator."""
+    load_deep_translator()  # Ensure translator is loaded
+    batch_translations = []
+
+    # Handle empty strings first
+    non_empty_texts = []
+    non_empty_indices = []
+
+    for idx, text in enumerate(batch_texts):
+        if text == '':
+            batch_translations.append('■  ')
+        else:
+            non_empty_texts.append(text)
+            non_empty_indices.append(idx)
+
+    if non_empty_texts:
+        try:
+            print(f"Batch translating {len(non_empty_texts)} texts at once with Deep Translator")
+
+            # Deep Translator can handle multiple texts at once
+            # Set up the translator with the correct source and target languages
+            translator = DeepGoogleTranslator(source=source_lang, target=target_lang)
+            translations = translator.translate_batch(non_empty_texts)
+
+            print(f"Done batch translating {len(non_empty_texts)} texts with Deep Translator")
+
+            # Insert translations back in the correct positions
+            for batch_idx, original_idx in enumerate(non_empty_indices):
+                if batch_idx < len(translations):
+                    # Insert at the position corresponding to the original text
+                    while len(batch_translations) <= original_idx:
+                        batch_translations.append(None)  # Pad if needed
+                    batch_translations[original_idx] = translations[batch_idx]
+                else:
+                    # Fallback if something went wrong with the batch indices
+                    batch_translations.append(non_empty_texts[batch_idx])
+
+            # Fill any remaining None values with original text as fallback
+            for idx, translation in enumerate(batch_translations):
+                if translation is None and idx < len(batch_texts):
+                    batch_translations[idx] = batch_texts[idx]
+
+        except Exception as e:
+            print(f"Deep Translator batch error: {e}")
+            print("Falling back to individual translation...")
+
+            # If batch translation fails, try translating one by one
+            translations = []
+            for text in non_empty_texts:
+                try:
+                    # Set up the translator with the correct source and target languages
+                    translator = DeepGoogleTranslator(source=source_lang, target=target_lang)
+                    result = translator.translate(text)
+                    translations.append(result)
+                except Exception as e:
+                    print(f"Error translating text '{text}': {e}")
+                    translations.append(text)  # Use original as fallback
+                # Add a small delay to avoid rate limiting
+                time.sleep(0.5)
 
             # Insert translations back in the correct positions
             for batch_idx, original_idx in enumerate(non_empty_indices):
@@ -219,7 +303,7 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
         output_pdf_path: Path to save the translated PDF
         source_lang: Source language code (default: 'auto')
         target_lang: Target language code (default: 'en')
-        translator_type: Type of translator to use ('local' or 'google')
+        translator_type: Type of translator to use ('local', 'google', or 'patch')
     """
     # Open the original document
     doc = fitz.open(input_pdf_path)
@@ -257,13 +341,15 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
     all_translations = []
 
     # Process in batches if needed to avoid memory issues
-    batch_size = 50  # Adjust based on your model's capacity
+    batch_size = 250  # Adjust based on your model's capacity
     for i in range(0, len(all_text_to_translate), batch_size):
         batch_texts = all_text_to_translate[i:i+batch_size]
         try:
             # Choose translation method based on user selection
             if translator_type.lower() == 'google':
                 batch_translations = batch_translate_with_google(batch_texts, source_lang, target_lang)
+            elif translator_type.lower() == 'deep':
+                batch_translations = batch_translate_with_deep(batch_texts, source_lang, target_lang)
             else:  # Default to local model
                 batch_translations = batch_translate_with_local_model(batch_texts)
 
@@ -276,8 +362,6 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
             all_translations.extend(batch_texts[len(all_translations) - i:])
 
     # Now create pages and add content
-    page_num = 1
-
     for page_number, page in enumerate(doc):
         # Create a new blank page with the same dimensions
         new_page = translated_doc.new_page(width=page.rect.width, height=page.rect.height)
@@ -323,8 +407,7 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
             xref = img_info['xref']
             image = extract_image_with_transparency(doc, xref)
 
-            # Extract the image bytes and other info
-            base_image = doc.extract_image(xref)
+            # Get the bounding box for the image
             bbox = img_info['bbox']
 
             image = image.resize((int(image.width * 0.8), int(image.height * 0.8)), resample=Image.LANCZOS)
@@ -389,10 +472,8 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
             else:
                 print(f"Unknown block type: {block}")
 
-        page_num += 1
-
     translated_doc.save(output_pdf_path)
-    translated_doc.save("compressed_output_v2.pdf", garbage=4, deflate=True, clean=True)
+    translated_doc.save("compressed_output_deep.pdf", garbage=4, deflate=True, clean=True)
     print(f"Translated PDF saved to {output_pdf_path}")
 
 
@@ -400,12 +481,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Translate PDF text with precise positioning')
     parser.add_argument('--input', type=str, default=r"C:\Users\161070\Downloads\pdf_file - Copy.pdf",
                         help='Path to input PDF file')
-    parser.add_argument('--output', type=str, default="translated_text_preserved.pdf",
+    parser.add_argument('--output', type=str, default="translated_text_preserved_deep.pdf",
                         help='Path to save translated PDF')
-    parser.add_argument('--translator', type=str, choices=['local', 'google'], default='google',
-                        help='Translator to use: local (mBART model) or google (Google Translate API)')
-    parser.add_argument('--source', type=str, default='zh-cn',
-                        help='Source language code (default: zh-cn)')
+    parser.add_argument('--translator', type=str, choices=['local', 'google', 'deep'], default='deep',
+                        help='Translator to use: local (mBART model), google (Google Translate API), or deep (Deep Translator)')
+    parser.add_argument('--source', type=str, default='zh-CN',
+                        help='Source language code (default: zh-CN)')
     parser.add_argument('--target', type=str, default='en',
                         help='Target language code (default: en)')
 
