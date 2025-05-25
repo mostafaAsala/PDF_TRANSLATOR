@@ -303,178 +303,191 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
         output_pdf_path: Path to save the translated PDF
         source_lang: Source language code (default: 'auto')
         target_lang: Target language code (default: 'en')
-        translator_type: Type of translator to use ('local', 'google', or 'patch')
+        translator_type: Type of translator to use ('local', 'google', or 'deep')
     """
     # Open the original document
     doc = fitz.open(input_pdf_path)
+    total_pages = len(doc)
 
     # Create a new empty document for the translation
     translated_doc = fitz.open()
 
-    # First, collect all text that needs translation from all pages
-    all_text_to_translate = []
-    text_metadata = []  # Store metadata for each text element
+    # Process pages in batches of 10
+    save_interval = 10
 
-    print("Collecting all text for translation...")
-    for page_number, page in enumerate(doc):
-        blocks = page.get_text("dict")["blocks"]
+    # Get base name and extension for intermediate saves
+    import os
+    base_name, ext = os.path.splitext(output_pdf_path)
 
-        for block in blocks:
-            if block['type'] == 0:  # Text block
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        text = span["text"].strip()
-                        if text:
-                            # Store the text and its metadata
-                            all_text_to_translate.append(text)
-                            text_metadata.append({
-                                'page_number': page_number,
-                                'bbox': span["bbox"],
-                                'font_size': span["size"],
-                                'color_int': span["color"],
-                                'text_font': span['font'],
-                                'flags': span['flags']
-                            })
+    for page_batch_start in range(0, total_pages, save_interval):
+        page_batch_end = min(page_batch_start + save_interval, total_pages)
+        print(f"\n--- Processing pages {page_batch_start+1} to {page_batch_end} of {total_pages} ---\n")
 
-    # Translate all text at once
-    print(f"Translating {len(all_text_to_translate)} text elements using {translator_type} translator...")
-    all_translations = []
+        # Process each page in the current batch
+        for page_number in range(page_batch_start, page_batch_end):
+            page = doc[page_number]
+            print(f"Processing page {page_number+1}/{total_pages}")
 
-    # Process in batches if needed to avoid memory issues
-    batch_size = 250  # Adjust based on your model's capacity
-    for i in range(0, len(all_text_to_translate), batch_size):
-        batch_texts = all_text_to_translate[i:i+batch_size]
-        try:
-            # Choose translation method based on user selection
-            if translator_type.lower() == 'google':
-                batch_translations = batch_translate_with_google(batch_texts, source_lang, target_lang)
-            elif translator_type.lower() == 'deep':
-                batch_translations = batch_translate_with_deep(batch_texts, source_lang, target_lang)
-            else:  # Default to local model
-                batch_translations = batch_translate_with_local_model(batch_texts)
+            # Collect text from this page
+            page_text_to_translate = []
+            page_text_metadata = []  # Store metadata for each text element
 
-            all_translations.extend(batch_translations)
-            print(f"Translated batch {i//batch_size + 1}/{(len(all_text_to_translate) + batch_size - 1)//batch_size}")
+            print(f"Collecting text from page {page_number+1}...")
+            blocks = page.get_text("dict")["blocks"]
 
-        except Exception as e:
-            print(f"Batch translation error: {e}")
-            # If batch fails, add original text as fallback
-            all_translations.extend(batch_texts[len(all_translations) - i:])
+            for block in blocks:
+                if block['type'] == 0:  # Text block
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text = span["text"].strip()
+                            if text:
+                                # Store the text and its metadata
+                                page_text_to_translate.append(text)
+                                page_text_metadata.append({
+                                    'bbox': span["bbox"],
+                                    'font_size': span["size"],
+                                    'color_int': span["color"],
+                                    'text_font': span['font'],
+                                    'flags': span['flags']
+                                })
 
-    # Now create pages and add content
-    for page_number, page in enumerate(doc):
-        # Create a new blank page with the same dimensions
-        new_page = translated_doc.new_page(width=page.rect.width, height=page.rect.height)
-        print(f"Processing page {page_number+1}/{len(doc)}, dimensions: {page.rect.width} x {page.rect.height}")
+            # Translate text for this page
+            if page_text_to_translate:
+                print(f"Translating {len(page_text_to_translate)} text elements from page {page_number+1} using {translator_type} translator...")
+                page_translations = []
 
-        # Get text blocks for this page (needed for structure)
-        blocks = page.get_text("dict")["blocks"]
+                # Process in batches if needed to avoid memory issues
+                batch_size = 250  # Adjust based on your model's capacity
+                for i in range(0, len(page_text_to_translate), batch_size):
+                    batch_texts = page_text_to_translate[i:i+batch_size]
+                    try:
+                        # Choose translation method based on user selection
+                        if translator_type.lower() == 'google':
+                            batch_translations = batch_translate_with_google(batch_texts, source_lang, target_lang)
+                        elif translator_type.lower() == 'deep':
+                            batch_translations = batch_translate_with_deep(batch_texts, source_lang, target_lang)
+                        else:  # Default to local model
+                            batch_translations = batch_translate_with_local_model(batch_texts)
 
-        # 1. First, extract and redraw all drawings (lines, shapes, etc.)
-        drawings = page.get_drawings()
-        for drawing in drawings:
-            shape = new_page.new_shape()
-            length = len(drawing["items"])
-            for i in range(length):
-                item = drawing["items"][i]
-                if item[0] == "l":  # line
-                    p1, p2 = item[1], item[2]
-                    # Only draw the line if it's not the extra connection between first and last points
-                    if i != length:  # Skip the line if it's the closing one
-                        shape.draw_line(p1, p2)
-                elif item[0] == "re":  # rectangle
-                    r = item[1]
-                    shape.draw_rect(r)
-                elif item[0] == "qu":  # curve
-                    p1, p2, p3 = item[1], item[2], item[3]
-                    shape.draw_line(p1, p3)  # approximate curve as line
-                elif item[0] == "c":  # curve
-                    shape.draw_bezier(item[1], item[2], item[3], item[4])
-                else:
-                    print(f"Unknown drawing item type: {item[0]}")
+                        page_translations.extend(batch_translations)
+                        print(f"Translated batch {i//batch_size + 1}/{(len(page_text_to_translate) + batch_size - 1)//batch_size}")
 
-            shape.finish(width=drawing['width'],
-                         color=drawing['color'],
-                         closePath=drawing['closePath'],
-                         fill=drawing['fill'],
-                         dashes=drawing['dashes'],
-                         stroke_opacity=1 if drawing.get("stroke_opacity", 1) is None else drawing.get("stroke_opacity", 1))
-            shape.commit()
-
-        # 2. Extract and copy all images
-        image_list = page.get_image_info(hashes=False, xrefs=True)
-        for idx, img_info in enumerate(image_list):
-            xref = img_info['xref']
-            image = extract_image_with_transparency(doc, xref)
-
-            # Get the bounding box for the image
-            bbox = img_info['bbox']
-
-            image = image.resize((int(image.width * 0.8), int(image.height * 0.8)), resample=Image.LANCZOS)
-
-            # Save modified image to bytes
-            output = io.BytesIO()
-            image.save(output, format="PNG", dpi=(72, 72), optimize=True)
-            output.seek(0)
-            modified_img_bytes = output.read()
-
-            image.save(f'images/extracted_image{idx}.png', 'PNG')  # Save as PNG
-            # Insert the image using raw bytes (preserves alpha if present)
-            new_page.insert_image(bbox, stream=modified_img_bytes, keep_proportion=False)
-
-        # 3. Add translated text for this page
-        for block in blocks:
-            if block['type'] == 0:  # Text block
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        text = span["text"].strip()
-                        if text:
-                            # Find the corresponding translation
-                            meta_indices = [i for i, meta in enumerate(text_metadata)
-                                           if meta['page_number'] == page_number and meta['bbox'] == span["bbox"]]
-
-                            if meta_indices:
-                                meta_index = meta_indices[0]
-                                translated_text = all_translations[meta_index]
-
-                                # Get metadata
-                                meta = text_metadata[meta_index]
-                                bbox = meta['bbox']
-                                font_size = meta['font_size']
-                                color_int = meta['color_int']
-                                text_font = 'helv'  # Using helv as standard font
-
-                                # Process and insert the translated text
-                                translated_text_clean = sanitize_text(translated_text)
-                                text_width = fitz.get_text_length(translated_text_clean, fontname='helv',
-                                                                 fontsize=font_size - 2)
-                                bbox_width = bbox[2] - bbox[0]
-
-                                scale_x = bbox_width / text_width if text_width > 0 else 1.0
-
-                                color_rgb = int_to_rgb(color_int)
-                                pivot = fitz.Point(bbox[0], bbox[1])
-                                mat = fitz.Matrix(scale_x, 1)
-                                morph = (pivot, mat)
-
-                                # Insert translated text at the same position
-                                new_page.insert_text(
-                                    (bbox[0], bbox[1] + 10),
-                                    translated_text,
-                                    fontsize=font_size - 2,
-                                    fontname=text_font,  # standard font
-                                    color=color_rgb,
-                                    morph=morph,
-                                )
-            elif block['type'] == 1:  # image
-                # Images are already handled above
-                pass
+                    except Exception as e:
+                        print(f"Batch translation error: {e}")
+                        # If batch fails, add original text as fallback
+                        page_translations.extend(batch_texts[len(page_translations) - i:])
             else:
-                print(f"Unknown block type: {block}")
+                page_translations = []
+                print(f"No text to translate on page {page_number+1}")
 
-    translated_doc.save(output_pdf_path)
-    translated_doc.save("compressed_output_deep.pdf", garbage=4, deflate=True, clean=True)
-    print(f"Translated PDF saved to {output_pdf_path}")
+            # Create a new blank page with the same dimensions
+            new_page = translated_doc.new_page(width=page.rect.width, height=page.rect.height)
+            print(f"Building page {page_number+1}, dimensions: {page.rect.width} x {page.rect.height}")
+
+            # 1. First, extract and redraw all drawings (lines, shapes, etc.)
+            drawings = page.get_drawings()
+            for drawing in drawings:
+                shape = new_page.new_shape()
+                length = len(drawing["items"])
+                for i in range(length):
+                    item = drawing["items"][i]
+                    if item[0] == "l":  # line
+                        p1, p2 = item[1], item[2]
+                        # Only draw the line if it's not the extra connection between first and last points
+                        if i != length:  # Skip the line if it's the closing one
+                            shape.draw_line(p1, p2)
+                    elif item[0] == "re":  # rectangle
+                        r = item[1]
+                        shape.draw_rect(r)
+                    elif item[0] == "qu":  # curve
+                        p1, p2, p3 = item[1], item[2], item[3]
+                        shape.draw_line(p1, p3)  # approximate curve as line
+                    elif item[0] == "c":  # curve
+                        shape.draw_bezier(item[1], item[2], item[3], item[4])
+                    else:
+                        print(f"Unknown drawing item type: {item[0]}")
+
+                shape.finish(width=drawing['width'],
+                            color=drawing['color'],
+                            closePath=drawing['closePath'],
+                            fill=drawing['fill'],
+                            dashes=drawing['dashes'],
+                            stroke_opacity=1 if drawing.get("stroke_opacity", 1) is None else drawing.get("stroke_opacity", 1))
+                shape.commit()
+
+            # 2. Extract and copy all images
+            image_list = page.get_image_info(hashes=False, xrefs=True)
+            for idx, img_info in enumerate(image_list):
+                xref = img_info['xref']
+                image = extract_image_with_transparency(doc, xref)
+
+                # Get the bounding box for the image
+                bbox = img_info['bbox']
+
+                image = image.resize((int(image.width * 0.8), int(image.height * 0.8)), resample=Image.LANCZOS)
+
+                # Save modified image to bytes
+                output = io.BytesIO()
+                image.save(output, format="PNG", dpi=(72, 72), optimize=True)
+                output.seek(0)
+                modified_img_bytes = output.read()
+
+                # Save image to file (optional)
+                image_dir = 'images'
+                if not os.path.exists(image_dir):
+                    os.makedirs(image_dir)
+                image.save(f'{image_dir}/page{page_number+1}_image{idx}.png', 'PNG')
+
+                # Insert the image using raw bytes (preserves alpha if present)
+                new_page.insert_image(bbox, stream=modified_img_bytes, keep_proportion=False)
+
+            # 3. Add translated text for this page
+            if page_text_to_translate:
+                for idx, (text, meta) in enumerate(zip(page_text_to_translate, page_text_metadata)):
+                    if idx < len(page_translations):
+                        translated_text = page_translations[idx]
+
+                        # Get metadata
+                        bbox = meta['bbox']
+                        font_size = meta['font_size']
+                        color_int = meta['color_int']
+                        text_font = 'helv'  # Using helv as standard font
+
+                        # Process and insert the translated text
+                        translated_text_clean = sanitize_text(translated_text)
+                        text_width = fitz.get_text_length(translated_text_clean, fontname='helv',
+                                                        fontsize=font_size - 2)
+                        bbox_width = bbox[2] - bbox[0]
+
+                        scale_x = bbox_width / text_width if text_width > 0 else 1.0
+
+                        color_rgb = int_to_rgb(color_int)
+                        pivot = fitz.Point(bbox[0], bbox[1])
+                        mat = fitz.Matrix(scale_x, 1)
+                        morph = (pivot, mat)
+
+                        # Insert translated text at the same position
+                        new_page.insert_text(
+                            (bbox[0], bbox[1] + 10),
+                            translated_text,
+                            fontsize=font_size - 2,
+                            fontname=text_font,  # standard font
+                            color=color_rgb,
+                            morph=morph,
+                        )
+
+        # Save the document after each batch of pages
+        if page_batch_end >= page_batch_start + 1:  # Only save if at least one page was processed
+            batch_output_path = f"{base_name}_pages_{page_batch_start+1}_to_{page_batch_end}{ext}"
+            translated_doc.save(batch_output_path,garbage=4, deflate=True, clean=True)
+            print(f"\nIntermediate PDF saved to {batch_output_path} (pages {page_batch_start+1} to {page_batch_end})")
+
+    # Save the final document
+    #translated_doc.save(output_pdf_path)
+    compressed_output = f"{base_name}_compressed{ext}"
+    translated_doc.save(compressed_output, garbage=4, deflate=True, clean=True)
+    print(f"\nFinal translated PDF saved to {output_pdf_path}")
+    print(f"Compressed version saved to {compressed_output}")
 
 
 if __name__ == "__main__":
