@@ -1,6 +1,8 @@
 import io
 import argparse
+import os
 import time
+from turtle import pd
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -9,7 +11,7 @@ from deep_translator import GoogleTranslator as DeepGoogleTranslator
 # Load model directly
 print("loading packages")
 from transformers import AutoTokenizer, MarianMTModel, AutoModelForSeq2SeqLM
-
+import pandas as pd
 src = "zh"  # source language
 trg = "en"  # target language
 print("loading model")
@@ -490,6 +492,18 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
     print(f"Compressed version saved to {compressed_output}")
 
 
+
+def bulck_translate_files(folder_path, result_path):
+    if isinstance(folder_path,str):
+        pdf_files = os.listdir(folder_path)
+        pdf_files = [os.path.join(folder_path,file) for file in pdf_files if str(file).endswith('.pdf')]
+    else:
+        pdf_files = folder_path
+    for file in pdf_files:
+        result_file = os.path.join(result_path,file.split('/')[-1])
+        translate_pdf_text_precise(file,result_file)
+        break
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Translate PDF text with precise positioning')
     parser.add_argument('--input', type=str, default=r"C:\Users\161070\Downloads\pdf_file - Copy.pdf",
@@ -506,4 +520,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"Using {args.translator} translator")
-    translate_pdf_text_precise(args.input, args.output, args.source, args.target, args.translator)
+    df = pd.read_csv('Data\Copy of chinees_only.csv')
+    links = df['SE_URL'].to_list()
+    #translate_pdf_text_precise(args.input, args.output, args.source, args.target, args.translator)
+    bulck_translate_files(links,'Results')
