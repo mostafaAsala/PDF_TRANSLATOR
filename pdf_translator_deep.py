@@ -2,7 +2,11 @@ import io
 import argparse
 import os
 import time
-from turtle import pd
+import tempfile
+import shutil
+import requests
+from urllib.parse import urlparse
+import pandas as pd
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -490,26 +494,170 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
     translated_doc.save(compressed_output, garbage=4, deflate=True, clean=True)
     print(f"\nFinal translated PDF saved to {output_pdf_path}")
     print(f"Compressed version saved to {compressed_output}")
+    return compressed_output
 
 
+def is_url(path):
+    """Check if the given path is a URL."""
+    try:
+        result = urlparse(path)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
 
-def bulck_translate_files(folder_path, result_path):
-    if isinstance(folder_path,str):
-        pdf_files = os.listdir(folder_path)
-        pdf_files = [os.path.join(folder_path,file) for file in pdf_files if str(file).endswith('.pdf')]
-    else:
-        pdf_files = folder_path
-    for file in pdf_files:
-        result_file = os.path.join(result_path,file.split('/')[-1])
-        translate_pdf_text_precise(file,result_file)
-        break
+def download_pdf_from_url(url, temp_dir):
+    """Download a PDF from a URL to a temporary directory.
+    
+    Args:
+        url: URL of the PDF to download
+        temp_dir: Temporary directory to save the downloaded PDF
+        
+    Returns:
+        Path to the downloaded PDF file or None if download failed
+    """
+    try:
+        print(f"Downloading PDF from {url}...")
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        
+        # Get the filename from the URL or use a default name
+        filename = os.path.basename(urlparse(url).path)
+        if not filename or not filename.lower().endswith('.pdf'):
+            filename = f"downloaded_{int(time.time())}.pdf"
+        
+        # Save the file to the temporary directory
+        file_path = os.path.join(temp_dir, filename)
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        print(f"PDF downloaded to {file_path}")
+        return file_path
+    except Exception as e:
+        print(f"Error downloading PDF from {url}: {e}")
+        return None
+
+def read_links_from_csv(csv_path, url_column):
+    """Read links from a CSV file.
+    
+    Args:
+        csv_path: Path to the CSV file
+        url_column: Name of the column containing URLs
+        
+    Returns:
+        List of URLs
+    """
+    try:
+        df = pd.read_csv(csv_path)
+        if url_column in df.columns:
+            links = df[url_column].tolist()
+            # Filter out NaN values and empty strings
+            links = [link for link in links if isinstance(link, str) and link.strip()]
+            return links
+        else:
+            print(f"Column '{url_column}' not found in CSV file. Available columns: {df.columns.tolist()}")
+            return []
+    except Exception as e:
+        print(f"Error reading CSV file: {e}")
+        return []
+
+def bulck_translate_files(input_source, result_path, source_lang='auto', target_lang='en', translator_type='deep'):
+    """Translate multiple PDF files.
+    
+    Args:
+        input_source: Path to folder with PDFs, list of PDF paths, or path to CSV file with links
+        result_path: Path to save translated PDFs
+        source_lang: Source language code
+        target_lang: Target language code
+        translator_type: Type of translator to use
+    """
+    # Create result directory if it doesn't exist
+    os.makedirs(result_path, exist_ok=True)
+    
+    # Create a temporary directory for downloaded files
+    temp_dir = tempfile.mkdtemp()
+    print(f"Created temporary directory: {temp_dir}")
+    
+    try:
+        # Case 1: Input is a CSV file
+        if isinstance(input_source, str) and input_source.lower().endswith('.csv'):
+            print(f"Reading links from CSV file: {input_source}")
+            # Assume the column name is 'SE_URL' by default, can be parameterized if needed
+            links = read_links_from_csv(input_source, 'SE_URL')
+            pdf_files = []
+            
+            # Process each link
+            for link in links:
+                try:
+                    if is_url(link):
+                        # Download the PDF if it's a URL
+                        pdf_path = download_pdf_from_url(link, temp_dir)
+                        if pdf_path:
+                            pdf_files.append(pdf_path)
+                    elif os.path.exists(link) and link.lower().endswith('.pdf'):
+                        # It's a local file path
+                        pdf_files.append(link)
+                    else:
+                        print(f"Invalid or non-existent PDF path: {link}")
+                except Exception as e:
+                    print(f"Error processing link {link}: {e}")
+        
+        # Case 2: Input is a directory
+        elif isinstance(input_source, str) and os.path.isdir(input_source):
+            print(f"Scanning directory for PDF files: {input_source}")
+            pdf_files = [os.path.join(input_source, file) for file in os.listdir(input_source) 
+                       if file.lower().endswith('.pdf')]
+        
+        # Case 3: Input is a list of paths or URLs
+        elif isinstance(input_source, list):
+            print(f"Processing list of {len(input_source)} paths/URLs")
+            pdf_files = []
+            for item in input_source:
+                try:
+                    if is_url(item):
+                        # Download the PDF if it's a URL
+                        pdf_path = download_pdf_from_url(item, temp_dir)
+                        if pdf_path:
+                            pdf_files.append(pdf_path)
+                    elif os.path.exists(item) and item.lower().endswith('.pdf'):
+                        # It's a local file path
+                        pdf_files.append(item)
+                    else:
+                        print(f"Invalid or non-existent PDF path: {item}")
+                except Exception as e:
+                    print(f"Error processing item {item}: {e}")
+        
+        else:
+            print(f"Unsupported input source type: {type(input_source)}")
+            return
+        
+        # Process each PDF file
+        print(f"Found {len(pdf_files)} PDF files to translate")
+        for i, file in enumerate(pdf_files):
+            try:
+                # Get the filename for the output
+                filename = os.path.basename(file)
+                result_file = os.path.join(result_path, f"translated_{filename}")
+                
+                print(f"[{i+1}/{len(pdf_files)}] Translating: {filename}")
+                translate_pdf_text_precise(file, result_file, source_lang, target_lang, translator_type)
+                print(f"Translated PDF saved to: {result_file}")
+            except Exception as e:
+                print(f"Error translating {file}: {e}")
+    
+    finally:
+        # Clean up temporary directory
+        print(f"Cleaning up temporary directory: {temp_dir}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Translate PDF text with precise positioning')
     parser.add_argument('--input', type=str, default=r"C:\Users\161070\Downloads\pdf_file - Copy.pdf",
-                        help='Path to input PDF file')
-    parser.add_argument('--output', type=str, default="translated_text_preserved_deep.pdf",
-                        help='Path to save translated PDF')
+                        help='Path to input PDF file or CSV file with links or directory with PDFs')
+    parser.add_argument('--output', type=str, default="Results",
+                        help='Directory to save translated PDFs')
+    parser.add_argument('--csv-column', type=str, default='SE_URL',
+                        help='Column name in CSV file containing PDF links (default: SE_URL)')
     parser.add_argument('--translator', type=str, choices=['local', 'google', 'deep'], default='deep',
                         help='Translator to use: local (mBART model), google (Google Translate API), or deep (Deep Translator)')
     parser.add_argument('--source', type=str, default='zh-CN',
@@ -520,7 +668,40 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"Using {args.translator} translator")
-    df = pd.read_csv('Data\Copy of chinees_only.csv')
-    links = df['SE_URL'].to_list()
-    #translate_pdf_text_precise(args.input, args.output, args.source, args.target, args.translator)
-    bulck_translate_files(links,'Results')
+    
+    # Determine input type and process accordingly
+    input_path = args.input
+    
+    if input_path.lower().endswith('.csv'):
+        print(f"Processing CSV file: {input_path}")
+        # CSV file with links
+        bulck_translate_files(input_path, args.output, args.source, args.target, args.translator)
+    elif input_path.lower().endswith('.pdf'):
+        print(f"Processing single PDF file: {input_path}")
+        # Single PDF file
+        os.makedirs(args.output, exist_ok=True)
+        output_file = os.path.join(args.output, f"translated_{os.path.basename(input_path)}")
+        translate_pdf_text_precise(input_path, output_file, args.source, args.target, args.translator)
+    elif os.path.isdir(input_path):
+        print(f"Processing directory of PDFs: {input_path}")
+        # Directory with PDFs
+        bulck_translate_files(input_path, args.output, args.source, args.target, args.translator)
+    else:
+        # Try to interpret as a URL
+        if is_url(input_path) and input_path.lower().endswith('.pdf'):
+            print(f"Processing PDF from URL: {input_path}")
+            # Create a temporary directory
+            temp_dir = tempfile.mkdtemp()
+            try:
+                # Download the PDF
+                pdf_path = download_pdf_from_url(input_path, temp_dir)
+                if pdf_path:
+                    # Translate the PDF
+                    os.makedirs(args.output, exist_ok=True)
+                    output_file = os.path.join(args.output, f"translated_{os.path.basename(pdf_path)}")
+                    translate_pdf_text_precise(pdf_path, output_file, args.source, args.target, args.translator)
+            finally:
+                # Clean up temporary directory
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        else:
+            print(f"Error: Input '{input_path}' is not a valid PDF file, CSV file, directory, or PDF URL.")
