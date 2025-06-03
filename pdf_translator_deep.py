@@ -20,7 +20,8 @@ src = "zh"  # source language
 trg = "en"  # target language
 print("loading model")
 model_name = f"Helsinki-NLP/opus-mt-{src}-{trg}"
-
+font_path ='ARIAL.TTF'
+text_font = fitz.Font(fontfile=font_path) 
 # Initialize Google Translator
 google_translator = GoogleTranslator()
 
@@ -91,6 +92,44 @@ def sanitize_text(text):
             text = str(text)
     # Remove non-printable characters and control characters
     return ''.join(c for c in text if c.isprintable())
+
+def contains_chinese(text):
+    """
+    Check if the given text contains Chinese characters.
+    
+    Args:
+        text: Text to check for Chinese characters
+        
+    Returns:
+        True if the text contains Chinese characters, False otherwise
+    """
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return False
+            
+    # Unicode ranges for Chinese characters
+    # CJK Unified Ideographs (Common): U+4E00 - U+9FFF
+    # CJK Unified Ideographs Extension A: U+3400 - U+4DBF
+    # CJK Unified Ideographs Extension B: U+20000 - U+2A6DF
+    # CJK Unified Ideographs Extension C: U+2A700 - U+2B73F
+    # CJK Unified Ideographs Extension D: U+2B740 - U+2B81F
+    # CJK Unified Ideographs Extension E: U+2B820 - U+2CEAF
+    # CJK Unified Ideographs Extension F: U+2CEB0 - U+2EBEF
+    
+    for char in text:
+        # Check if the character is in the main CJK Unified Ideographs range or Extension A
+        if ('一' <= char <= '鿿') or ('㐀' <= char <= '䶿'):
+            return True
+        
+        # Check for characters in higher Unicode planes (Extension B-F)
+        # These are represented as surrogate pairs in Python strings
+        cp = ord(char)
+        if 0x20000 <= cp <= 0x2EBEF:
+            return True
+            
+    return False
 
 def batch_translate_with_local_model(batch_texts):
     """Translate a batch of texts using the local model."""
@@ -406,8 +445,12 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
                         r = item[1]
                         shape.draw_rect(r)
                     elif item[0] == "qu":  # curve
-                        p1, p2, p3 = item[1], item[2], item[3]
-                        shape.draw_line(p1, p3)  # approximate curve as line
+                        if len(item) >= 3:
+                            p1, p2 = item[1], item[2]
+                            shape.draw_line(p1, p2)
+                        else:
+                            print("Warning: 'qu' command has insufficient points:", item)
+                            pass
                     elif item[0] == "c":  # curve
                         shape.draw_bezier(item[1], item[2], item[3], item[4])
                     else:
@@ -450,19 +493,31 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
             # 3. Add translated text for this page
             if page_text_to_translate:
                 for idx, (text, meta) in enumerate(zip(page_text_to_translate, page_text_metadata)):
+                    
                     if idx < len(page_translations):
-                        translated_text = page_translations[idx]
+                        # Check if the original text contains Chinese characters
+                        if contains_chinese(text):
+                            print(text)
+                            # Use the translated text if the original contains Chinese
+                            display_text = page_translations[idx]
+                        else:
+                            # Use the original text if it doesn't contain Chinese
+                            display_text = text
 
                         # Get metadata
                         bbox = meta['bbox']
                         font_size = meta['font_size']
                         color_int = meta['color_int']
-                        text_font = 'helv'  # Using helv as standard font
+                        text_font = fitz.Font(fontfile=font_path)  # Using helv as standard font
 
-                        # Process and insert the translated text
-                        translated_text_clean = sanitize_text(translated_text)
-                        text_width = fitz.get_text_length(translated_text_clean, fontname='helv',
-                                                        fontsize=font_size - 2)
+                        # Process and insert the text
+                        display_text_clean = sanitize_text(display_text)
+                        try:
+                            text_width = fitz.get_text_length(display_text_clean, fontname=text_font.name,
+                                                    fontsize=font_size - 2)
+                        except:
+                            text_width = fitz.get_text_length(display_text_clean, fontname='helv',
+                                                    fontsize=font_size - 2)
                         bbox_width = bbox[2] - bbox[0]
 
                         scale_x = bbox_width / text_width if text_width > 0 else 1.0
@@ -471,13 +526,17 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
                         pivot = fitz.Point(bbox[0], bbox[1])
                         mat = fitz.Matrix(scale_x, 1)
                         morph = (pivot, mat)
-
-                        # Insert translated text at the same position
+                        if display_text =='20∆4':
+                            print("----------------------------------------------------")
+                            print("Found 20∆4",page_translations[idx])
+                            print("----------------------------------------------------")
+                        # Insert text at the same position
                         new_page.insert_text(
                             (bbox[0], bbox[1] + 10),
-                            translated_text,
+                            display_text,
                             fontsize=font_size - 2,
-                            fontname=text_font,  # standard font
+                            fontname="custom",  # standard font
+                            fontfile="C:/Windows/Fonts/arial.ttf",
                             color=color_rgb,
                             morph=morph,
                         )
@@ -652,7 +711,7 @@ def bulck_translate_files(input_source, result_path, source_lang='auto', target_
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Translate PDF text with precise positioning')
-    parser.add_argument('--input', type=str, default=r"C:\Users\161070\Downloads\pdf_file - Copy.pdf",
+    parser.add_argument('--input', type=str, default=r"C:\Users\161070\Downloads\data1.pdf",
                         help='Path to input PDF file or CSV file with links or directory with PDFs')
     parser.add_argument('--output', type=str, default="Results",
                         help='Directory to save translated PDFs')
