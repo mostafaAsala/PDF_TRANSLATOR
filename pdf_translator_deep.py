@@ -577,15 +577,27 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
             print(f"\nIntermediate PDF saved to {batch_output_path} (pages {page_batch_start+1} to {page_batch_end})")
 
     # Save the final document
-    #translated_doc.save(output_pdf_path)
-    print("saving file...........")
-
-    compressed_output = f"{base_name}_compressed{ext}"
-    output_pdf_path = os.path.join(output_dir, compressed_output)
-    translated_doc.save(compressed_output, garbage=4, deflate=True, clean=True)
-    print(f"\nFinal translated PDF saved to {output_pdf_path}")
-    print(f"Compressed version saved to {compressed_output}")
-    return compressed_output
+    # Get the base name of the input file for the output filename
+    input_base_name = os.path.basename(input_pdf_path)
+    input_base_name, _ = os.path.splitext(input_base_name)
+    
+    # Create the output filename with the input file's base name
+    output_filename = f"{input_base_name}_translated{ext}"
+    
+    # Get the output directory from the output_pdf_path
+    output_dir = os.path.dirname(output_pdf_path)
+    
+    # Create the full output path in the specified output directory
+    output_file_path = os.path.join(output_dir, output_filename)
+    
+    print("Saving final translated file...........")
+    
+    # Save the translated document with the input file's base name
+    translated_doc.save(output_file_path, garbage=4, deflate=True, clean=True)
+    print(f"\nFinal translated PDF saved to {output_file_path}")
+    
+    # Return the path to the final translated file
+    return output_file_path
 
 
 def is_url(path):
@@ -669,6 +681,9 @@ def bulck_translate_files(input_source, result_path, source_lang='auto', target_
     temp_dir = tempfile.mkdtemp()
     print(f"Created temporary directory: {temp_dir}")
     
+    # Initialize a list to store translation log data
+    translation_log = []
+    
     try:
         # Case 1: Input is a CSV file
         if isinstance(input_source, str) and input_source.lower().endswith('.csv'):
@@ -685,9 +700,13 @@ def bulck_translate_files(input_source, result_path, source_lang='auto', target_
                         pdf_path = download_pdf_from_url(link, temp_dir)
                         if pdf_path:
                             pdf_files.append(pdf_path)
+                            # Store the original link and the downloaded path for logging
+                            translation_log.append({"input_source": link, "input_path": pdf_path, "output_path": None})
                     elif os.path.exists(link) and link.lower().endswith('.pdf'):
                         # It's a local file path
                         pdf_files.append(link)
+                        # Store the file path for logging
+                        translation_log.append({"input_source": link, "input_path": link, "output_path": None})
                     else:
                         print(f"Invalid or non-existent PDF path: {link}")
                 except Exception as e:
@@ -696,8 +715,13 @@ def bulck_translate_files(input_source, result_path, source_lang='auto', target_
         # Case 2: Input is a directory
         elif isinstance(input_source, str) and os.path.isdir(input_source):
             print(f"Scanning directory for PDF files: {input_source}")
-            pdf_files = [os.path.join(input_source, file) for file in os.listdir(input_source) 
-                       if file.lower().endswith('.pdf')]
+            pdf_files = []
+            for file in os.listdir(input_source):
+                if file.lower().endswith('.pdf'):
+                    file_path = os.path.join(input_source, file)
+                    pdf_files.append(file_path)
+                    # Store the file path for logging
+                    translation_log.append({"input_source": input_source, "input_path": file_path, "output_path": None})
         
         # Case 3: Input is a list of paths or URLs
         elif isinstance(input_source, list):
@@ -710,9 +734,13 @@ def bulck_translate_files(input_source, result_path, source_lang='auto', target_
                         pdf_path = download_pdf_from_url(item, temp_dir)
                         if pdf_path:
                             pdf_files.append(pdf_path)
+                            # Store the original link and the downloaded path for logging
+                            translation_log.append({"input_source": item, "input_path": pdf_path, "output_path": None})
                     elif os.path.exists(item) and item.lower().endswith('.pdf'):
                         # It's a local file path
                         pdf_files.append(item)
+                        # Store the file path for logging
+                        translation_log.append({"input_source": item, "input_path": item, "output_path": None})
                     else:
                         print(f"Invalid or non-existent PDF path: {item}")
                 except Exception as e:
@@ -726,17 +754,34 @@ def bulck_translate_files(input_source, result_path, source_lang='auto', target_
         print(f"Found {len(pdf_files)} PDF files to translate")
         for i, file in enumerate(pdf_files):
             try:
-                # Get the filename for the output
-                filename = os.path.basename(file)
-                result_file = os.path.join(result_path, f"translated_{filename}")
+                # Get the filename for the output based on input filename
+                input_filename = os.path.basename(file)
+                input_base_name, ext = os.path.splitext(input_filename)
+                result_file = os.path.join(result_path, f"{input_base_name}_translated{ext}")
                 
-                print(f"[{i+1}/{len(pdf_files)}] Translating: {filename}")
-                translate_pdf_text_precise(file, result_file, source_lang, target_lang, translator_type)
-                print(f"Translated PDF saved to: {result_file}")
+                print(f"[{i+1}/{len(pdf_files)}] Translating: {input_filename}")
+                output_path = translate_pdf_text_precise(file, result_file, source_lang, target_lang, translator_type)
+                print(f"Translated PDF saved to: {output_path}")
+                
+                # Update the log with the output path
+                for log_entry in translation_log:
+                    if log_entry["input_path"] == file:
+                        log_entry["output_path"] = output_path
+                        break
             except Exception as e:
                 print(f"Error translating {file}: {e}")
     
     finally:
+        # Save the translation log to a CSV file
+        if translation_log:
+            log_file = os.path.join(result_path, f"translation_log_{int(time.time())}.csv")
+            try:
+                df = pd.DataFrame(translation_log)
+                df.to_csv(log_file, index=False)
+                print(f"Translation log saved to {log_file}")
+            except Exception as e:
+                print(f"Error saving translation log: {e}")
+        
         # Clean up temporary directory
         print(f"Cleaning up temporary directory: {temp_dir}")
         shutil.rmtree(temp_dir, ignore_errors=True)
