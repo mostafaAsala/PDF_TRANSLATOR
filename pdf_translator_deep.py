@@ -363,8 +363,8 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
     # Get base name and extension for intermediate saves
     
     
-    base_name = os.path.basename(base_name)
-    base_name, ext = os.path.splitext(output_pdf_path)
+    base_name = os.path.basename(output_pdf_path)
+    base_name, ext = os.path.splitext(base_name)
     # Create a directory for batch files
     batch_dir = os.path.join(os.path.dirname(output_pdf_path), 'batch_files')
     os.makedirs(batch_dir, exist_ok=True)
@@ -389,7 +389,7 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
                 if block['type'] == 0:  # Text block
                     for line in block["lines"]:
                         for span in line["spans"]:
-                            text = span["text"].strip()
+                            text = span["text"]#.strip()
                             if text:
                                 # Store the text and its metadata
                                 page_text_to_translate.append(text)
@@ -403,29 +403,53 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
 
             # Translate text for this page
             if page_text_to_translate:
-                print(f"Translating {len(page_text_to_translate)} text elements from page {page_number+1} using {translator_type} translator...")
-                page_translations = []
+                # Filter out only the Chinese text for translation
+                chinese_texts = []
+                chinese_indices = []
+                
+                # Identify Chinese text and their indices
+                for idx, text in enumerate(page_text_to_translate):
+                    if contains_chinese(text):
+                        chinese_texts.append(text)
+                        chinese_indices.append(idx)
+                
+                # Initialize translations list with the original texts
+                page_translations = page_text_to_translate.copy()
+                
+                if chinese_texts:
+                    print(f"Translating {len(chinese_texts)} Chinese text elements from page {page_number+1} using {translator_type} translator...")
+                    
+                    # Process Chinese texts in batches to avoid memory issues
+                    batch_size = 50  # Adjust based on your model's capacity
+                    chinese_translations = []
+                    
+                    for i in range(0, len(chinese_texts), batch_size):
+                        batch_texts = chinese_texts[i:i+batch_size]
+                        try:
+                            # Choose translation method based on user selection
+                            if translator_type.lower() == 'google':
+                                batch_translations = batch_translate_with_google(batch_texts, source_lang, target_lang)
+                            elif translator_type.lower() == 'deep':
+                                batch_translations = batch_translate_with_deep(batch_texts, source_lang, target_lang)
+                            else:  # Default to local model
+                                batch_translations = batch_translate_with_local_model(batch_texts)
 
-                # Process in batches if needed to avoid memory issues
-                batch_size = 50  # Adjust based on your model's capacity
-                for i in range(0, len(page_text_to_translate), batch_size):
-                    batch_texts = page_text_to_translate[i:i+batch_size]
-                    try:
-                        # Choose translation method based on user selection
-                        if translator_type.lower() == 'google':
-                            batch_translations = batch_translate_with_google(batch_texts, source_lang, target_lang)
-                        elif translator_type.lower() == 'deep':
-                            batch_translations = batch_translate_with_deep(batch_texts, source_lang, target_lang)
-                        else:  # Default to local model
-                            batch_translations = batch_translate_with_local_model(batch_texts)
+                            chinese_translations.extend(batch_translations)
+                            print(f"Translated batch {i//batch_size + 1}/{(len(chinese_texts) + batch_size - 1)//batch_size}")
 
-                        page_translations.extend(batch_translations)
-                        print(f"Translated batch {i//batch_size + 1}/{(len(page_text_to_translate) + batch_size - 1)//batch_size}")
-
-                    except Exception as e:
-                        print(f"Batch translation error: {e}")
-                        # If batch fails, add original text as fallback
-                        page_translations.extend(batch_texts[len(page_translations) - i:])
+                        except Exception as e:
+                            print(f"Batch translation error: {e}")
+                            # If batch fails, add original text as fallback
+                            chinese_translations.extend(batch_texts[len(chinese_translations) - i:])
+                    
+                    # Replace the Chinese texts with their translations in the original order
+                    for idx, trans_idx in enumerate(chinese_indices):
+                        if idx < len(chinese_translations):
+                            page_translations[trans_idx] = chinese_translations[idx]
+                    
+                    print(f"Successfully translated {len(chinese_texts)} Chinese text elements")
+                else:
+                    print(f"No Chinese text to translate on page {page_number+1}")
             else:
                 page_translations = []
                 print(f"No text to translate on page {page_number+1}")
@@ -502,7 +526,6 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
                     if idx < len(page_translations):
                         # Check if the original text contains Chinese characters
                         if contains_chinese(text):
-                            print(text)
                             # Use the translated text if the original contains Chinese
                             display_text = page_translations[idx]
                         else:
@@ -513,29 +536,24 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
                         bbox = meta['bbox']
                         font_size = meta['font_size']
                         color_int = meta['color_int']
-                        text_font = fitz.Font(fontfile=font_path)  # Using helv as standard font
-
+                        
                         # Process and insert the text
-                        display_text_clean = sanitize_text(display_text)
+                        display_text_clean = display_text #sanitize_text(display_text)
                         try:
-                            text_width = fitz.get_text_length(display_text_clean, fontname=text_font.name,
-                                                    fontsize=font_size - 2)
+                            text_width = fitz.get_text_length(display_text_clean, fontname="custom",  # standard font
+                                                fontfile="C:/Windows/Fonts/arial.ttf",fontsize=font_size - 2)
                         except:
-                            text_width = fitz.get_text_length(display_text_clean, fontname='helv',
-                                                    fontsize=font_size - 2)
+                            text_width = fitz.get_text_length(display_text_clean, fontname='helv',fontsize=font_size - 2)
                         bbox_width = bbox[2] - bbox[0]
 
                         scale_x = bbox_width / text_width if text_width > 0 else 1.0
-
+                        if scale_x > 1:
+                            scale_x = 1
                         color_rgb = int_to_rgb(color_int)
                         pivot = fitz.Point(bbox[0], bbox[1])
                         mat = fitz.Matrix(scale_x, 1)
                         morph = (pivot, mat)
-                        if display_text =='20∆4':
-                            print("----------------------------------------------------")
-                            print("Found 20∆4",page_translations[idx])
-                            print("----------------------------------------------------")
-                        # Insert text at the same position
+                        
                         new_page.insert_text(
                             (bbox[0], bbox[1] + 10),
                             display_text,
@@ -549,7 +567,7 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
         # Save the document after each batch of pages
         if page_batch_end >= page_batch_start + 1:  # Only save if at least one page was processed
             # Create a filename for the batch file
-            batch_filename = f"pages_{1}_to_{page_batch_end}{ext}"
+            batch_filename = f"{base_name}_pages_{1}_to_{page_batch_end}{ext}"
             
             # Full path in the batch_files directory
             batch_output_path = os.path.join(batch_dir, batch_filename)
@@ -560,7 +578,10 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
 
     # Save the final document
     #translated_doc.save(output_pdf_path)
+    print("saving file...........")
+
     compressed_output = f"{base_name}_compressed{ext}"
+    output_pdf_path = os.path.join(output_dir, compressed_output)
     translated_doc.save(compressed_output, garbage=4, deflate=True, clean=True)
     print(f"\nFinal translated PDF saved to {output_pdf_path}")
     print(f"Compressed version saved to {compressed_output}")
