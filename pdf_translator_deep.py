@@ -361,8 +361,13 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
     save_interval = 10
 
     # Get base name and extension for intermediate saves
-    import os
+    
+    
+    base_name = os.path.basename(base_name)
     base_name, ext = os.path.splitext(output_pdf_path)
+    # Create a directory for batch files
+    batch_dir = os.path.join(os.path.dirname(output_pdf_path), 'batch_files')
+    os.makedirs(batch_dir, exist_ok=True)
 
     for page_batch_start in range(0, total_pages, save_interval):
         page_batch_end = min(page_batch_start + save_interval, total_pages)
@@ -402,7 +407,7 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
                 page_translations = []
 
                 # Process in batches if needed to avoid memory issues
-                batch_size = 250  # Adjust based on your model's capacity
+                batch_size = 50  # Adjust based on your model's capacity
                 for i in range(0, len(page_text_to_translate), batch_size):
                     batch_texts = page_text_to_translate[i:i+batch_size]
                     try:
@@ -543,8 +548,14 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
 
         # Save the document after each batch of pages
         if page_batch_end >= page_batch_start + 1:  # Only save if at least one page was processed
-            batch_output_path = f"{base_name}_pages_{page_batch_start+1}_to_{page_batch_end}{ext}"
-            translated_doc.save(batch_output_path,garbage=4, deflate=True, clean=True)
+            # Create a filename for the batch file
+            batch_filename = f"pages_{1}_to_{page_batch_end}{ext}"
+            
+            # Full path in the batch_files directory
+            batch_output_path = os.path.join(batch_dir, batch_filename)
+            
+            # Save the batch file
+            translated_doc.save(batch_output_path, garbage=4, deflate=True, clean=True)
             print(f"\nIntermediate PDF saved to {batch_output_path} (pages {page_batch_start+1} to {page_batch_end})")
 
     # Save the final document
