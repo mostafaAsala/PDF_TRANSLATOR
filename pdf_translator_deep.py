@@ -7,14 +7,14 @@ import shutil
 import requests
 from urllib.parse import urlparse
 import pandas as pd
-
+import traceback
 import fitz  # PyMuPDF
+import unicodedata
 from PIL import Image
 from googletrans import Translator as GoogleTranslator
 from deep_translator import GoogleTranslator as DeepGoogleTranslator
 # Load model directly
 print("loading packages")
-from transformers import AutoTokenizer, MarianMTModel, AutoModelForSeq2SeqLM
 import pandas as pd
 src = "zh"  # source language
 trg = "en"  # target language
@@ -33,6 +33,7 @@ tokenizer = None
 model = None
 
 def load_local_model():
+    from transformers import AutoTokenizer, MarianMTModel, AutoModelForSeq2SeqLM
     global tokenizer, model
     if tokenizer is None or model is None:
         print("Loading local translation model...")
@@ -54,6 +55,42 @@ def int_to_rgb(color_int):
     g = ((color_int >> 8) & 255) / 255
     b = (color_int & 255) / 255
     return (r, g, b)
+
+
+def get_page_pixmap_from_xref(doc, xref, matrix=None):
+    # Render a Form XObject into an image
+    xobj = fitz.xref_object(doc, xref, compressed=True)
+    form = fitz.open("pdf", xobj.encode("utf-8"))  # fake PDF from the Form
+    page = form[0]
+    matrix = matrix or fitz.Matrix(1, 1)
+    pix = page.get_pixmap(matrix=matrix, alpha=True)
+    return pix
+
+
+# Monkey patch (optional, for reuse)
+fitz.Document.get_page_pixmap_from_xref = get_page_pixmap_from_xref
+
+
+def extract_image_or_form_as_image(doc, xref, bbox, matrix=None):
+    obj = doc.xref_object(xref, compressed=False)
+    
+    # --- Case 1: Regular image ---
+    if "/Subtype /Image" in obj:
+        return extract_image_with_transparency(doc, xref)
+
+    # --- Case 2: Form XObject ---
+    if "/Subtype /Form" in obj:
+        # Create a temporary page to render the form
+        # Define a matrix for scaling if needed
+        form_rect = fitz.Rect(bbox)
+        matrix = matrix or fitz.Matrix(1, 1)  # scale = 1
+
+        pix = doc.get_page_pixmap_from_xref(xref, matrix=matrix)
+        image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGBA")
+        return image
+
+    # --- Unknown subtype ---
+    raise ValueError(f"Unsupported XObject subtype in xref {xref}")
 
 def extract_image_with_transparency(doc, xref):
     # Step 1: Get image object dictionary
@@ -79,6 +116,9 @@ def extract_image_with_transparency(doc, xref):
     smask_data = smask_info["image"]
     smask = Image.open(io.BytesIO(smask_data)).convert("L")  # grayscale alpha mask
 
+    # Step 4: Resize alpha mask if needed
+    if img.size != smask.size:
+        smask = smask.resize(img.size, resample=Image.BILINEAR)
     # Step 4: Combine RGB image with alpha channel
     img.putalpha(smask)
 
@@ -350,255 +390,324 @@ def translate_pdf_text_precise(input_pdf_path, output_pdf_path, source_lang='aut
         target_lang: Target language code (default: 'en')
         translator_type: Type of translator to use ('local', 'google', or 'deep')
     """
-    # Open the original document
-    doc = fitz.open(input_pdf_path)
-    total_pages = len(doc)
+    try:
+        # Open the original document
+        doc = fitz.open(input_pdf_path)
+        total_pages = len(doc)
 
-    # Create a new empty document for the translation
-    translated_doc = fitz.open()
+        # Create a new empty document for the translation
+        translated_doc = fitz.open()
 
-    # Process pages in batches of 10
-    save_interval = 10
+        # Process pages in batches of 10
+        save_interval = 10
 
-    # Get base name and extension for intermediate saves
-    
-    
-    base_name = os.path.basename(output_pdf_path)
-    base_name, ext = os.path.splitext(base_name)
-    # Create a directory for batch files
-    batch_dir = os.path.join(os.path.dirname(output_pdf_path), 'batch_files')
-    os.makedirs(batch_dir, exist_ok=True)
+        # Get base name and extension for intermediate saves
+        
+        
+        base_name = os.path.basename(output_pdf_path)
+        base_name, ext = os.path.splitext(base_name)
+        # Create a directory for batch files
+        batch_dir = os.path.join(os.path.dirname(output_pdf_path), 'batch_files')
+        os.makedirs(batch_dir, exist_ok=True)
 
-    for page_batch_start in range(0, total_pages, save_interval):
-        page_batch_end = min(page_batch_start + save_interval, total_pages)
-        print(f"\n--- Processing pages {page_batch_start+1} to {page_batch_end} of {total_pages} ---\n")
+        for page_batch_start in range(0, total_pages, save_interval):
+            page_batch_end = min(page_batch_start + save_interval, total_pages)
+            print(f"\n--- Processing pages {page_batch_start+1} to {page_batch_end} of {total_pages} ---\n")
 
-        # Process each page in the current batch
-        for page_number in range(page_batch_start, page_batch_end):
-            page = doc[page_number]
-            print(f"Processing page {page_number+1}/{total_pages}")
+            # Process each page in the current batch
+            for page_number in range(page_batch_start, page_batch_end):
+                page = doc[page_number]
+                print(f"Processing page {page_number+1}/{total_pages}")
 
-            # Collect text from this page
-            page_text_to_translate = []
-            page_text_metadata = []  # Store metadata for each text element
+                # Collect text from this page
+                page_text_to_translate = []
+                page_text_metadata = []  # Store metadata for each text element
 
-            print(f"Collecting text from page {page_number+1}...")
-            blocks = page.get_text("dict")["blocks"]
+                print(f"Collecting text from page {page_number+1}...")
+                blocks = page.get_text("dict")["blocks"]
 
-            for block in blocks:
-                if block['type'] == 0:  # Text block
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            text = span["text"]#.strip()
-                            if text:
-                                # Store the text and its metadata
-                                page_text_to_translate.append(text)
-                                page_text_metadata.append({
-                                    'bbox': span["bbox"],
-                                    'font_size': span["size"],
-                                    'color_int': span["color"],
-                                    'text_font': span['font'],
-                                    'flags': span['flags']
-                                })
+                for block in blocks:
+                    if block['type'] == 0:  # Text block
+                        for line in block["lines"]:
+                            for span in line["spans"]:
+                                text = span["text"]#.strip()
+                                if text:
+                                    # Store the text and its metadata
+                                    page_text_to_translate.append(text)
+                                    page_text_metadata.append({
+                                        'bbox': span["bbox"],
+                                        'font_size': span["size"],
+                                        'color_int': span["color"],
+                                        'text_font': span['font'],
+                                        'flags': span['flags']
+                                    })
 
-            # Translate text for this page
-            if page_text_to_translate:
-                # Filter out only the Chinese text for translation
-                chinese_texts = []
-                chinese_indices = []
-                
-                # Identify Chinese text and their indices
-                for idx, text in enumerate(page_text_to_translate):
-                    if contains_chinese(text):
-                        chinese_texts.append(text)
-                        chinese_indices.append(idx)
-                
-                # Initialize translations list with the original texts
-                page_translations = page_text_to_translate.copy()
-                
-                if chinese_texts:
-                    print(f"Translating {len(chinese_texts)} Chinese text elements from page {page_number+1} using {translator_type} translator...")
+                # Translate text for this page
+                if page_text_to_translate:
+                    # Filter out only the Chinese text for translation
+                    chinese_texts = []
+                    chinese_indices = []
                     
-                    # Process Chinese texts in batches to avoid memory issues
-                    batch_size = 50  # Adjust based on your model's capacity
-                    chinese_translations = []
-                    
-                    for i in range(0, len(chinese_texts), batch_size):
-                        batch_texts = chinese_texts[i:i+batch_size]
-                        try:
-                            # Choose translation method based on user selection
-                            if translator_type.lower() == 'google':
-                                batch_translations = batch_translate_with_google(batch_texts, source_lang, target_lang)
-                            elif translator_type.lower() == 'deep':
-                                batch_translations = batch_translate_with_deep(batch_texts, source_lang, target_lang)
-                            else:  # Default to local model
-                                batch_translations = batch_translate_with_local_model(batch_texts)
-
-                            chinese_translations.extend(batch_translations)
-                            print(f"Translated batch {i//batch_size + 1}/{(len(chinese_texts) + batch_size - 1)//batch_size}")
-
-                        except Exception as e:
-                            print(f"Batch translation error: {e}")
-                            # If batch fails, add original text as fallback
-                            chinese_translations.extend(batch_texts[len(chinese_translations) - i:])
-                    
-                    # Replace the Chinese texts with their translations in the original order
-                    for idx, trans_idx in enumerate(chinese_indices):
-                        if idx < len(chinese_translations):
-                            page_translations[trans_idx] = chinese_translations[idx]
-                    
-                    print(f"Successfully translated {len(chinese_texts)} Chinese text elements")
-                else:
-                    print(f"No Chinese text to translate on page {page_number+1}")
-            else:
-                page_translations = []
-                print(f"No text to translate on page {page_number+1}")
-
-            # Create a new blank page with the same dimensions
-            new_page = translated_doc.new_page(width=page.rect.width, height=page.rect.height)
-            print(f"Building page {page_number+1}, dimensions: {page.rect.width} x {page.rect.height}")
-
-            # 1. First, extract and redraw all drawings (lines, shapes, etc.)
-            drawings = page.get_drawings()
-            for drawing in drawings:
-                shape = new_page.new_shape()
-                length = len(drawing["items"])
-                for i in range(length):
-                    item = drawing["items"][i]
-                    if item[0] == "l":  # line
-                        p1, p2 = item[1], item[2]
-                        # Only draw the line if it's not the extra connection between first and last points
-                        if i != length:  # Skip the line if it's the closing one
-                            shape.draw_line(p1, p2)
-                    elif item[0] == "re":  # rectangle
-                        r = item[1]
-                        shape.draw_rect(r)
-                    elif item[0] == "qu":  # curve
-                        if len(item) >= 3:
-                            p1, p2 = item[1], item[2]
-                            shape.draw_line(p1, p2)
-                        else:
-                            print("Warning: 'qu' command has insufficient points:", item)
-                            pass
-                    elif item[0] == "c":  # curve
-                        shape.draw_bezier(item[1], item[2], item[3], item[4])
-                    else:
-                        print(f"Unknown drawing item type: {item[0]}")
-
-                shape.finish(width=drawing['width'],
-                            color=drawing['color'],
-                            closePath=drawing['closePath'],
-                            fill=drawing['fill'],
-                            dashes=drawing['dashes'],
-                            stroke_opacity=1 if drawing.get("stroke_opacity", 1) is None else drawing.get("stroke_opacity", 1))
-                shape.commit()
-
-            # 2. Extract and copy all images
-            image_list = page.get_image_info(hashes=False, xrefs=True)
-            for idx, img_info in enumerate(image_list):
-                xref = img_info['xref']
-                image = extract_image_with_transparency(doc, xref)
-
-                # Get the bounding box for the image
-                bbox = img_info['bbox']
-
-                image = image.resize((int(image.width * 0.8), int(image.height * 0.8)), resample=Image.LANCZOS)
-
-                # Save modified image to bytes
-                output = io.BytesIO()
-                image.save(output, format="PNG", dpi=(72, 72), optimize=True)
-                output.seek(0)
-                modified_img_bytes = output.read()
-
-                # Save image to file (optional)
-                image_dir = 'images'
-                if not os.path.exists(image_dir):
-                    os.makedirs(image_dir)
-                image.save(f'{image_dir}/page{page_number+1}_image{idx}.png', 'PNG')
-
-                # Insert the image using raw bytes (preserves alpha if present)
-                new_page.insert_image(bbox, stream=modified_img_bytes, keep_proportion=False)
-
-            # 3. Add translated text for this page
-            if page_text_to_translate:
-                for idx, (text, meta) in enumerate(zip(page_text_to_translate, page_text_metadata)):
-                    
-                    if idx < len(page_translations):
-                        # Check if the original text contains Chinese characters
+                    # Identify Chinese text and their indices
+                    for idx, text in enumerate(page_text_to_translate):
                         if contains_chinese(text):
-                            # Use the translated text if the original contains Chinese
-                            display_text = page_translations[idx]
-                        else:
-                            # Use the original text if it doesn't contain Chinese
-                            display_text = text
-
-                        # Get metadata
-                        bbox = meta['bbox']
-                        font_size = meta['font_size']
-                        color_int = meta['color_int']
+                            chinese_texts.append(text)
+                            chinese_indices.append(idx)
+                    
+                    # Initialize translations list with the original texts
+                    page_translations = page_text_to_translate.copy()
+                    
+                    if chinese_texts:
+                        print(f"Translating {len(chinese_texts)} Chinese text elements from page {page_number+1} using {translator_type} translator...")
                         
-                        # Process and insert the text
-                        display_text_clean = display_text #sanitize_text(display_text)
+                        # Process Chinese texts in batches to avoid memory issues
+                        batch_size = 50  # Adjust based on your model's capacity
+                        chinese_translations = []
+                        
+                        for i in range(0, len(chinese_texts), batch_size):
+                            batch_texts = chinese_texts[i:i+batch_size]
+                            try:
+                                # Choose translation method based on user selection
+                                if translator_type.lower() == 'google':
+                                    batch_translations = batch_translate_with_google(batch_texts, source_lang, target_lang)
+                                elif translator_type.lower() == 'deep':
+                                    batch_translations = batch_translate_with_deep(batch_texts, source_lang, target_lang)
+                                else:  # Default to local model
+                                    batch_translations = batch_translate_with_local_model(batch_texts)
+
+                                chinese_translations.extend(batch_translations)
+                                print(f"Translated batch {i//batch_size + 1}/{(len(chinese_texts) + batch_size - 1)//batch_size}")
+
+                            except Exception as e:
+                                print(f"Batch translation error: {traceback.format_exc()}")
+                                # If batch fails, add original text as fallback
+                                chinese_translations.extend(batch_texts[len(chinese_translations) - i:])
+                        
+                        # Replace the Chinese texts with their translations in the original order
+                        for idx, trans_idx in enumerate(chinese_indices):
+                            if idx < len(chinese_translations):
+                                page_translations[trans_idx] = chinese_translations[idx]
+                        
+                        print(f"Successfully translated {len(chinese_texts)} Chinese text elements")
+                    else:
+                        print(f"No Chinese text to translate on page {page_number+1}")
+                else:
+                    page_translations = []
+                    print(f"No text to translate on page {page_number+1}")
+
+                # Create a new blank page with the same dimensions
+                new_page = translated_doc.new_page(width=page.rect.width, height=page.rect.height)
+                print(f"Building page {page_number+1}, dimensions: {page.rect.width} x {page.rect.height}")
+
+                # 1. First, extract and redraw all drawings (lines, shapes, etc.)
+                drawings = page.get_drawings()
+                for drawing in drawings:
+                    shape = new_page.new_shape()
+                    length = len(drawing["items"])
+                    for i in range(length):
                         try:
-                            text_width = fitz.get_text_length(display_text_clean, fontname="custom",  # standard font
-                                                fontfile="C:/Windows/Fonts/arial.ttf",fontsize=font_size - 2)
-                        except:
-                            text_width = fitz.get_text_length(display_text_clean, fontname='helv',fontsize=font_size - 2)
-                        bbox_width = bbox[2] - bbox[0]
+                            item = drawing["items"][i]
+                            if item[0] == "l":  # line
+                                p1, p2 = item[1], item[2]
+                                # Only draw the line if it's not the extra connection between first and last points
+                                if i != length:  # Skip the line if it's the closing one
+                                    shape.draw_line(p1, p2)
+                            elif item[0] == "re":  # rectangle
+                                r = item[1]
+                                shape.draw_rect(r)
+                            elif item[0] == "qu":  # curve
+                                quad = item[1]
+                                if len(item) >= 3:
+                                    p1, p2 = item[1], item[2]
+                                    shape.draw_line(p1, p2)
+                                else:
+                                    
+                                    shape.draw_quad(quad)
+                                    # shape.draw_line(quad.p1, quad.p2)  # Or draw the full quad as 4 lines
+                                    # shape.draw_line(quad.p2, quad.p3)
+                                    # shape.draw_line(quad.p3, quad.p4)
+                                    # shape.draw_line(quad.p4, quad.p1)
+                            elif item[0] == "c":  # curve
+                                shape.draw_bezier(item[1], item[2], item[3], item[4])
+                            else:
+                                print(f"Unknown drawing item type: {item[0]}")
+                        except Exception as e:
+                            print(f"Error processing drawing item: {traceback.format_exc()}")
+                    
+                    try:
+                        shape.finish(width=drawing['width'],
+                                color=drawing['color'],
+                                closePath=drawing['closePath'],
+                                fill=drawing['fill'],
+                                dashes=drawing['dashes'],
+                                stroke_opacity=1 if drawing.get("stroke_opacity", 1) is None else drawing.get("stroke_opacity", 1))
+                        shape.commit()
+                    except Exception as e:
+                        print(f"Error finishing shape: {traceback.format_exc()}")
+                print("drawing2")
+                # 2. Extract and copy all images
+                image_list = page.get_image_info(hashes=False, xrefs=True)
+                for idx, img_info in enumerate(image_list):
+                    try:
+                        xref = img_info['xref']
 
-                        scale_x = bbox_width / text_width if text_width > 0 else 1.0
-                        if scale_x > 1:
-                            scale_x = 1
-                        color_rgb = int_to_rgb(color_int)
-                        pivot = fitz.Point(bbox[0], bbox[1])
-                        mat = fitz.Matrix(scale_x, 1)
-                        morph = (pivot, mat)
-                        
-                        new_page.insert_text(
-                            (bbox[0], bbox[1] + 10),
-                            display_text,
-                            fontsize=font_size - 2,
-                            fontname="custom",  # standard font
-                            fontfile="C:/Windows/Fonts/arial.ttf",
-                            color=color_rgb,
-                            morph=morph,
-                        )
+                        # Get the bounding box for the image
+                        bbox = img_info['bbox']
 
-        # Save the document after each batch of pages
-        if page_batch_end >= page_batch_start + 1:  # Only save if at least one page was processed
-            # Create a filename for the batch file
-            batch_filename = f"{base_name}_pages_{1}_to_{page_batch_end}{ext}"
-            
-            # Full path in the batch_files directory
-            batch_output_path = os.path.join(batch_dir, batch_filename)
-            
-            # Save the batch file
-            translated_doc.save(batch_output_path, garbage=4, deflate=True, clean=True)
-            print(f"\nIntermediate PDF saved to {batch_output_path} (pages {page_batch_start+1} to {page_batch_end})")
+                        image = extract_image_or_form_as_image(doc, xref, bbox)
 
-    # Save the final document
-    # Get the base name of the input file for the output filename
-    input_base_name = os.path.basename(input_pdf_path)
-    input_base_name, _ = os.path.splitext(input_base_name)
-    
-    # Create the output filename with the input file's base name
-    output_filename = f"{input_base_name}_translated{ext}"
-    
-    # Get the output directory from the output_pdf_path
-    output_dir = os.path.dirname(output_pdf_path)
-    
-    # Create the full output path in the specified output directory
-    output_file_path = os.path.join(output_dir, output_filename)
-    
-    print("Saving final translated file...........")
-    
-    # Save the translated document with the input file's base name
-    translated_doc.save(output_file_path, garbage=4, deflate=True, clean=True)
-    print(f"\nFinal translated PDF saved to {output_file_path}")
-    
-    # Return the path to the final translated file
-    return output_file_path
+                        image = image.resize((int(image.width * 0.8), int(image.height * 0.8)), resample=Image.LANCZOS)
 
+                        # Save modified image to bytes
+                        output = io.BytesIO()
+                        image.save(output, format="PNG", dpi=(72, 72), optimize=True)
+                        output.seek(0)
+                        modified_img_bytes = output.read()
+
+                        # Save image to file (optional)
+                        image_dir = 'images'
+                        if not os.path.exists(image_dir):
+                            os.makedirs(image_dir)
+                        image.save(f'{image_dir}/page{page_number+1}_image{idx}.png', 'PNG')
+                        if image.mode not in ("RGB", "RGBA"):
+                            image = image.convert("RGBA")
+                        # Insert the image using raw bytes (preserves alpha if present)
+                        new_page.insert_image(bbox, 
+                            stream=modified_img_bytes, 
+                            keep_proportion=False,
+                            width=image.width,
+                            height=image.height,
+                            xref=0,  # allow MuPDF to assign new xref
+                            overlay=True  # insert over existing content if needed
+                            )
+                    except Exception as e:
+                        print(f"Error processing image: {traceback.format_exc()}")
+                print("image")
+                # 3. Add translated text for this page
+                if page_text_to_translate:
+                    for idx, (text, meta) in enumerate(zip(page_text_to_translate, page_text_metadata)):
+                        try:
+                            if idx < len(page_translations):
+                                # Check if the original text contains Chinese characters
+                                if contains_chinese(text):
+                                    # Use the translated text if the original contains Chinese
+                                    display_text = page_translations[idx]
+                                else:
+                                    # Use the original text if it doesn't contain Chinese
+                                    display_text = text
+                    
+                                # Get metadata
+                                bbox = meta['bbox']
+                                font_size = meta['font_size']
+                                color_int = meta['color_int']
+                                
+                                # Process and insert the text
+                                display_text_clean = display_text #sanitize_text(display_text)
+                                try:
+                                    text_width = fitz.get_text_length(display_text_clean, fontname="custom",  # standard font
+                                                        fontfile="C:/Windows/Fonts/arial.ttf",fontsize=font_size)
+                                except:
+                                    text_width = fitz.get_text_length(display_text_clean, fontname='helv',fontsize=font_size)
+                                bbox_width = bbox[2] - bbox[0]
+
+                                scale_x = bbox_width / text_width if text_width > 0 else 1.0
+                                if scale_x > 1:
+                                    scale_x = 1
+                                color_rgb = int_to_rgb(color_int)
+                                pivot = fitz.Point(bbox[0], bbox[1])
+                                mat = fitz.Matrix(scale_x, 1)
+                                morph = (pivot, mat)
+                                """display_text = display_text.replace("，", ",")
+                                display_text = display_text.replace("。", ".")
+                                display_text = display_text.replace("？", "?")
+                                display_text = display_text.replace("！", "!")
+                                display_text = display_text.replace("；", ";")
+                                display_text = display_text.replace("：", ":")
+                                display_text = display_text.replace("（", "(")
+                                display_text = display_text.replace("）", ")")
+                                display_text = display_text.replace("【", "[")
+                                display_text = display_text.replace("】", "]")
+                                display_text = display_text.replace("《", "<")
+                                display_text = display_text.replace("》", ">")
+                                display_text = display_text.replace("、", ",")
+                                display_text = display_text.replace("、", ",")
+                                display_text = display_text.replace("＝", "=")
+                                display_text = display_text.replace("＋", "+")
+                                display_text = display_text.replace("－", "-")
+                                display_text = display_text.replace("＊", "*")
+                                display_text = display_text.replace("／", "/")
+                                display_text = display_text.replace("％", "%")
+                                display_text = display_text.replace("％", "%")
+                                display_text = display_text.replace("≤", "<=")
+                                display_text = display_text.replace("≥", ">=")
+                                display_text = display_text.replace("℃", "C")
+                                display_text = display_text.replace("℉", "F")
+                                display_text = display_text.replace("∆", "Δ")
+                                display_text = display_text.replace("±", "±")"""
+                                def unicode_normalize(text):
+                                    return unicodedata.normalize("NFKC", text)
+
+                                display_text = unicode_normalize(display_text)
+                                new_page.insert_text(
+                                    (bbox[0], bbox[1]+10),
+                                    display_text,
+                                    fontsize=font_size ,
+                                    fontname="arial",  # standard font
+                                    fontfile="C:/Windows/Fonts/arial.ttf",
+                                    color=color_rgb,
+                                    morph=morph,
+                                )
+                        except Exception as e:
+                            print(f"Error inserting text: {traceback.format_exc()}")
+                print("text")
+            print("Saving batch file")
+            try:
+                # Save the document after each batch of pages
+                if page_batch_end >= page_batch_start + 1:  # Only save if at least one page was processed
+                    # Create a filename for the batch file
+                    batch_filename = f"{base_name}_pages_{1}_to_{page_batch_end}{ext}"
+                
+                    # Full path in the batch_files directory
+                    batch_output_path = os.path.join(batch_dir, batch_filename)
+                    # Create a new PDF document
+                    copied_doc = fitz.open()
+
+                    # Insert all pages from the original document
+                    copied_doc.insert_pdf(translated_doc)
+                    # Save the batch file
+                    copied_doc.save(batch_output_path, garbage=4, deflate=True, clean=True)
+                    print(f"\nIntermediate PDF saved to {batch_output_path} (pages {page_batch_start+1} to {page_batch_end})")
+            except Exception as e:
+                print(f"Error saving batch file: {traceback.format_exc()}")
+        # Save the final document
+        # Get the base name of the input file for the output filename
+        input_base_name = os.path.basename(input_pdf_path)
+        input_base_name, _ = os.path.splitext(input_base_name)
+        
+        # Create the output filename with the input file's base name
+        output_filename = f"{input_base_name}_translated{ext}"
+        
+        # Get the output directory from the output_pdf_path
+        output_dir = os.path.dirname(output_pdf_path)
+        
+        # Create the full output path in the specified output directory
+        output_file_path = os.path.join(output_dir, output_filename)
+        
+        print("Saving final translated file...........")
+
+        try:
+        # Save the translated document with the input file's base name
+            translated_doc.save(output_file_path, garbage=4, deflate=True, clean=True)
+            print(f"\nFinal translated PDF saved to {output_file_path}")
+        except Exception as e:
+            print(f"Error saving final translated file: {traceback.format_exc()}")
+            translated_doc.save(output_file_path)
+            print(f"\nFinal translated PDF saved to {output_file_path}")
+        # Return the path to the final translated file
+        return output_file_path
+    except Exception as e:
+        print(f"Error saving final translated file: {traceback.format_exc()}")
+        return None
 
 def is_url(path):
     """Check if the given path is a URL."""
@@ -769,7 +878,7 @@ def bulck_translate_files(input_source, result_path, source_lang='auto', target_
                         log_entry["output_path"] = output_path
                         break
             except Exception as e:
-                print(f"Error translating {file}: {e}")
+                print(f"Error translating {file}: {traceback.format_exc()}")
     
     finally:
         # Save the translation log to a CSV file
