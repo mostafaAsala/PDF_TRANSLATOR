@@ -60,9 +60,7 @@ PDF_TRANSLATOR/
 
 | Original PDF (Chinese)                   | Translated PDF (English)               |
 | ---------------------------------------- | -------------------------------------- |
-| ![Before](https://github.com/user-attachments/assets/19e175b4-2ade-4078-aa57-101978857fe6)
- | ![After](https://github.com/user-attachments/assets/45973dbe-2591-4688-9ebf-7a614df8f5b5)
- |
+| ![Before](https://github.com/user-attachments/assets/19e175b4-2ade-4078-aa57-101978857fe6) | ![After](https://github.com/user-attachments/assets/45973dbe-2591-4688-9ebf-7a614df8f5b5) |
 
 ---
 
